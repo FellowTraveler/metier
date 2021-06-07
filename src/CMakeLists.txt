@@ -54,8 +54,24 @@ else()
   )
 endif()
 
+if(WIN32)
+  set(APP_ICON_RESOURCE_WINDOWS
+      "${${PROJECT_NAME}_SOURCE_DIR}/package/windows/app.rc"
+  )
+else()
+  set(APP_ICON_RESOURCE_WINDOWS "")
+endif()
+
+set(MACOSX_BUNDLE_ICON_FILE icon.icns)
+
+set(${PROJECT_NAME}_ICON ${CMAKE_CURRENT_SOURCE_DIR}/icon.icns)
+set_source_files_properties(${${PROJECT_NAME}_ICON} PROPERTIES
+       MACOSX_PACKAGE_LOCATION "Resources")
+
 add_executable(
   "${PROJECT_NAME}"
+  MACOSX_BUNDLE
+  ${${PROJECT_NAME}_ICON}
   "${object-deps}"
   "${cxx-sources}"
   "${cxx-headers}"
@@ -115,4 +131,5 @@ if(METIER_USE_DEFAULT_BLOCKCHAIN)
   )
 endif()
 
-install(TARGETS "${PROJECT_NAME}")
+install(TARGETS "${PROJECT_NAME}"
+    BUNDLE DESTINATION /Applications)
