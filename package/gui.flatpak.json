@@ -134,7 +134,8 @@
       "buildsystem": "cmake-ninja",
       "builddir": true,
       "config-opts": [
-        "-DCMAKE_UNITY_BUILD=ON"
+        "-DCMAKE_UNITY_BUILD=ON",
+        "-DMETIER_QML_INTERFACE=ON"
       ],
       "sources": [
         {

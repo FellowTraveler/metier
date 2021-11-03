@@ -1,0 +1,241 @@
+version: 2.1
+
+configuration:
+  - xcode_version: &xcode_version 13.3.1
+  - cache_key_tools: &cache_key_tools cache-tools-v1
+  - cache_key_vcpkg: &cache_key_vcpkg cache-vcpkg-v1-{{ checksum "~/project/deps/vcpkg.qml.txt" }}
+
+executors:
+  my_executor:
+    macos:
+      xcode: *xcode_version
+    resource_class: macos.x86.medium.gen2
+
+commands:
+  cmd_checkout:
+    description: "command to get the code"
+    steps:
+      - checkout
+      - run:
+          name: "checkout submodules (circleci doesn't do that by default)"
+          working_directory: "~/project"
+          command: |
+            git submodule sync --recursive
+            git submodule update --recursive --init
+  cmd_prepare_tools:
+    description: "command to prepare all build dependencies (code deps, gems, tools)"
+    steps:
+      - restore_cache:
+          name: "restore cache tools"
+          key: *cache_key_tools
+      - run:
+          name: "install brew tools"
+          command: |
+            brew install automake
+            brew install cmake
+            brew install pkg-config
+            brew install ninja
+            brew install pyenv
+            brew install ghr
+      - run:
+          name: "install python2 (required by qt 5)"
+          command: |
+            pyenv install 2.7.18 --skip-existing
+      - run:
+          name: "install vcpkg (@2021.12.01)"
+          working_directory: "~/"
+          command: |
+            if [ ! -d vcpkg ]; then
+              git clone -b 2021.12.01 --depth 1 --single-branch https://github.com/microsoft/vcpkg
+            fi
+      - save_cache:
+          name: "save cache tools"
+          key: *cache_key_tools
+          paths:
+            - /Users/distiller/vcpkg
+            - /Users/distiller/.pyenv/versions/2.7.18
+  cmd_build_vcpkg_deps:
+    description: "command to build vcpkg dependencies"
+    steps:
+      - restore_cache:
+          name: "restore cache vcpkg binaries"
+          key: *cache_key_vcpkg
+      - run:
+          environment:
+            PATH: /Users/distiller/.pyenv/versions/2.7.18/bin
+          name: "configure vcpkg & build deps"
+          working_directory: "~/"
+          no_output_timeout: 40m
+          #cp -r vcpkg/scripts/buildsystems/osx... is a workaround for https://github.com/microsoft/vcpkg/issues/15469
+          command: |
+            if [ ! -d vcpkg-binaries ]; then
+              echo -e 'set(VCPKG_BUILD_TYPE release)\n' >> project/deps/vcpkg/triplets/x64-osx.cmake
+              cat project/deps/vcpkg/triplets/x64-osx.cmake
+              ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+              ./vcpkg/vcpkg remove --outdated --recurse --overlay-ports=project/deps/vcpkg/ports
+              ./vcpkg/vcpkg install --triplet=x64-osx --overlay-triplets=project/deps/vcpkg/triplets --overlay-ports=project/deps/vcpkg/ports @project/deps/vcpkg.qml.txt --clean-after-build
+              ./vcpkg/vcpkg export --x-all-installed --raw --output-dir=/Users/distiller --output=vcpkg-binaries
+              cp -r vcpkg/scripts/buildsystems/osx vcpkg-binaries/scripts/buildsystems
+            else
+              echo "vcpkg-binaries restored from cache, skipping build :)"
+            fi
+      - save_cache:
+          name: "save cache vcpkg binaries"
+          key: *cache_key_vcpkg
+          paths:
+            - "/Users/distiller/vcpkg-binaries"
+  cmd_build_wallet:
+    description: "command to build target application"
+    steps:
+      - run:
+          environment:
+            PATH: /Users/distiller/.pyenv/versions/2.7.18/bin
+          name: "build wallet"
+          working_directory: "~/"
+          command: |
+            mkdir build
+            cd build
+            cmake -GNinja \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DMETIER_PEDANTIC_BUILD=OFF \
+                  -DMETIER_BUNDLED_OPENTXS=ON \
+                  -DMETIER_QML_INTERFACE=ON \
+                  -DCMAKE_TOOLCHAIN_FILE=/Users/distiller/vcpkg-binaries/scripts/buildsystems/vcpkg.cmake \
+                  ../project/
+            cmake --build .
+      - run:
+          name: "store packaging info"
+          working_directory: "~/build"
+          command: |
+            cat app_name.txt >> $BASH_ENV
+            cat bundle_id.txt >> $BASH_ENV
+            cat cli_name.txt >> $BASH_ENV
+            cat release_version.txt >> $BASH_ENV
+  cmd_prepare_signing:
+    description: "command to prepare keychain for app signing"
+    steps:
+      - run: 
+          name: "set local env vars for signing"
+          command: |
+            echo 'export CERTIFICATE_PATH="/Users/distiller/signing/build_certificate.p12"' >> $BASH_ENV
+            echo 'export APIKEY_PATH="/Users/distiller/signing/AuthKey_${APIKEY_ID}.p8"' >> $BASH_ENV
+            echo 'export KEYCHAIN_PATH="/Users/distiller/signing/app-signing.keychain-db"' >> $BASH_ENV
+      - run:
+          name: "print env vars for signing"
+          command: |
+            echo $CERTIFICATE_PATH
+            echo $APIKEY_PATH
+            echo $KEYCHAIN_PATH
+            echo $BUILD_CERTIFICATE_BASE64
+            echo $APIKEY_BASE64
+            echo $APIKEY_ID
+            echo $KEYCHAIN_PASSWORD
+            echo $P12_PASSWORD
+            echo $TEAM_ID
+            echo $NOTARIZE_APPLE_ID
+            echo $NOTARIZE_PASSWORD
+            echo $app_name
+            echo $bundle_id
+            echo $cli_name
+            echo $release_version
+      - run:
+          name: "import certificate and provisioning profile from secrets"
+          command: |
+            mkdir /Users/distiller/signing
+            echo -n $BUILD_CERTIFICATE_BASE64 | base64 --decode --output $CERTIFICATE_PATH
+            echo -n $APIKEY_BASE64 | base64 --decode --output $APIKEY_PATH
+      - run:
+          name: "create temp keychain"
+          command: |
+            security create-keychain -p $KEYCHAIN_PASSWORD $KEYCHAIN_PATH
+            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+            security unlock-keychain -p $KEYCHAIN_PASSWORD $KEYCHAIN_PATH
+      - run:
+          name: "import certificate to keychain"
+          command: |
+            security import $CERTIFICATE_PATH -P $P12_PASSWORD -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+            security list-keychain -d user -s $KEYCHAIN_PATH
+  cmd_sign_app:
+    description: "command to sign app"
+    steps:
+      - run: 
+          name: "sign applications"
+          working_directory: "/Users/distiller/build"
+          command: |
+            codesign --deep -o runtime -f -s $TEAM_ID src/$app_name.app
+            codesign --deep -o runtime -f -s $TEAM_ID src/cli/$cli_name
+  cmd_create_dmg:
+    description: "command to package app into dmg"
+    steps:
+      - run: 
+          name: "package into DiskImage"
+          working_directory: "~"
+          command: |
+            cpack -G DragNDrop --config /Users/distiller/build/CPackConfig.cmake
+  cmd_notarize_and_staple:
+    description: "command to notarize and staple app"
+    steps:
+      - run: 
+          name: "notarize + staple app & cli"
+          working_directory: "~"
+          #TODO retrieve submit id and use it for getting submission log
+          #xcrun notarytool log eb1fa8d6-bf1a-4529-b82a-1a90e36918f2 --apple-id $NOTARIZE_APPLE_ID --team-id $TEAM_ID --password $NOTARIZE_PASSWORD
+          command: |
+            echo $app_name-$release_version.dmg
+            echo $cli_name-$release_version.dmg
+
+            xcrun notarytool submit --apple-id $NOTARIZE_APPLE_ID --team-id $TEAM_ID --password $NOTARIZE_PASSWORD --wait --timeout 300 $app_name-$release_version.dmg
+            xcrun stapler staple $app_name-$release_version.dmg
+
+            xcrun notarytool submit --apple-id $NOTARIZE_APPLE_ID --team-id $TEAM_ID --password $NOTARIZE_PASSWORD --wait --timeout 300 $cli_name-$release_version.dmg
+            xcrun stapler staple $cli_name-$release_version.dmg
+
+            mkdir notarized
+            cp $app_name-$release_version.dmg notarized/
+            cp $cli_name-$release_version.dmg notarized/
+  cmd_store_artifacts:
+    steps:
+      - store_artifacts:
+          name: "store artifacts to circleci"
+          path: /Users/distiller/notarized
+          destination: release
+      - run:
+          name: "push release to github"
+          working_directory: "~/notarized"
+          #https://circleci.com/blog/publishing-to-github-releases-via-circleci/
+          #https://github.com/tcnksm/ghr#options
+          command: |
+            ghr -t ${GITHUB_PAT} \
+                -u ${CIRCLE_PROJECT_USERNAME} \
+                -r ${CIRCLE_PROJECT_REPONAME} \
+                -c ${CIRCLE_SHA1} \
+                -n ${CIRCLE_TAG} \
+                -b ${CIRCLE_TAG} \
+                -delete ${CIRCLE_TAG} .
+jobs:
+  build-wallet-macos:
+    executor: my_executor
+    environment:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      - cmd_prepare_tools
+      - cmd_checkout
+      - cmd_build_vcpkg_deps
+      - cmd_build_wallet
+      - cmd_prepare_signing
+      - cmd_sign_app
+      - cmd_create_dmg
+      - cmd_notarize_and_staple
+      - cmd_store_artifacts
+workflows:
+  version: 2
+  matterfi-wallet-macos:
+    jobs:
+      - build-wallet-macos:
+          context: ctx-matterfi-01
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /(dawgs-|pkt-|cci-dawgs-|cci-pkt-)(.*)-release/
