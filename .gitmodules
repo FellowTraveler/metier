@@ -6,7 +6,7 @@
 	url = https://github.com/nayuki/QR-Code-generator.git
 [submodule "deps/opentxs"]
 	path = deps/opentxs
-	url = https://github.com/open-transactions/opentxs
+	url = https://github.com/matterfi/opentxs.git
 [submodule "deps/vcpkg"]
 	path = deps/vcpkg
 	url = https://github.com/microsoft/vcpkg
